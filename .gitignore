@@ -1,0 +1,8 @@
+bin/
+obj/
+*.user
+
+# Trust anchors and certificates must be established out-of-band per deployment, never committed.
+# See amd/README.md.
+amd/*.pem
+amd/cert_chain*

@@ -1,0 +1,26 @@
+<Project Sdk="Microsoft.NET.Sdk.Web">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <RootNamespace>SevSnpDemo.Server</RootNamespace>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+    <!-- Publishing self-contained means the CVM needs no .NET runtime installed, and the deployed
+         artifact is a single tree that is easier to measure. -->
+    <InvariantGlobalization>true</InvariantGlobalization>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="../Shared/Shared.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- Microsoft's official TSS.MSR managed TPM stack. Needed only for the Azure paravisor path,
+         where attestation goes through the vTPM (NV read + TPM2_Quote) rather than configfs-tsm.
+         The client has no TPM dependency: the AK arrives as a JWK, so plain RSA verification is
+         enough on that side. -->
+    <PackageReference Include="Microsoft.TSS" Version="2.1.1" />
+  </ItemGroup>
+
+</Project>
