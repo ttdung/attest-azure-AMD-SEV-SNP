@@ -413,115 +413,169 @@ one your VM actually supports instead of inferring it from a fallback.
 
 ### The client needs the pinned AMD root
 
-Follow [`amd/README.md`](amd/README.md) to produce `amd/ark.pem` and verify its fingerprint. The
-client exits with a usage message (and status 2) if the file is absent — it will not fetch the
-anchor for you.
+`amd/ark.pem`, matching your processor generation, established out of band — see
+[`amd/README.md`](amd/README.md) and step 0 below. The client exits with a usage message (status 2)
+if it is absent; it will not fetch its own trust anchor.
 
 ---
 
-## Build
+## Running the project
+
+The whole flow, in order. Commands marked **[mac]** run on your workstation, **[cvm]** inside the
+confidential VM. Substitute your own VM address for `<cvm>`.
+
+### 0. One-time: pin the AMD root  **[mac]**
+
+The client will not fetch its own trust anchor, so this must exist before anything else works.
+Follow [`amd/README.md`](amd/README.md) to produce `amd/ark.pem` **for your processor generation**
+and verify its fingerprint out of band.
+
+```bash
+lscpu | grep -i "model name"      # [cvm] -- which generation is this?
+cp amd/ark-Genoa.pem amd/ark.pem  # [mac] -- or ark-Milan.pem / ark-Turin.pem
+```
+
+Getting this wrong is not subtle: the client fails with `No issuer for 'ARK-<Product>'` and names the
+generation it actually needed.
+
+### 1. Build and self-test  **[mac]**
 
 ```bash
 dotnet build SevSnpDemo.sln
+dotnet run --project SelfTest
 ```
 
-Warnings are errors in all three projects.
+Warnings are errors in all four projects. The self-test must print `ALL CHECKS PASSED` — it covers
+the vTPM verification logic, which cannot be exercised without a CVM.
 
-### Deploying the server to the CVM
+### 2. Publish and deploy the server  **[mac]**
 
-Publishing self-contained means the CVM needs no .NET runtime installed, and the deployed tree is a
-single self-consistent artifact:
+Self-contained, so the CVM needs no .NET runtime installed and the deployed tree is one
+self-consistent artifact:
 
 ```bash
 dotnet publish Server -c Release -r linux-x64 --self-contained -o out/server
 
-# Note the trailing /. and the -p. Without the dot, scp nests the directory inside an
-# existing ~/attested-hello (giving ~/attested-hello/server/Server); without -p it may
-# drop the executable bit.
+# The trailing /. matters: without it, scp nests the directory inside an existing
+# ~/attested-hello, giving ~/attested-hello/server/Server. -p preserves the exec bit.
 scp -rp out/server/. azureuser@<cvm>:~/attested-hello/
 ```
 
-The executable is named after the project, so it is `Server` with a capital S — the published
-directory contains `Server` (the apphost) alongside `Server.dll` and the runtime.
+The executable is named after the project — `Server`, capital S — and sits beside `Server.dll` and
+the runtime.
 
-On the CVM:
+### 3. Generate the manifest  **[cvm]**  *(optional; needed for `--manifest`)*
 
 ```bash
-# Only matters for the configfs-tsm path; harmless otherwise.
+APPDIR=$(dirname "$(find ~/attested-hello -name Server -type f | head -1)")
+cd "$APPDIR" && chmod +x Server
+
+for f in Server.dll Server.runtimeconfig.json Server.deps.json; do
+  [ -f "$f" ] || { echo "MISSING: $f"; exit 1; }
+done
+sha256sum Server.dll Server.runtimeconfig.json Server.deps.json > ~/manifest.txt
+cat ~/manifest.txt
+```
+
+Write it **outside** the tree you are hashing. See
+[Choosing what to put in the manifest](#choosing-what-to-put-in-the-manifest) for the trade-offs, and
+the sync rule at the end of this section.
+
+### 4. Start the server  **[cvm]**
+
+```bash
+# Only needed for the configfs-tsm path; harmless otherwise.
 sudo mountpoint -q /sys/kernel/config || sudo mount -t configfs none /sys/kernel/config
 
-ls -l ~/attested-hello/Server            # confirm the path before blaming the code
-chmod +x ~/attested-hello/Server         # in case the exec bit did not survive the copy
-
-sudo SEVSNP_PORT=8443 SEVSNP_AMD_PRODUCT=Milan ~/attested-hello/Server
+sudo SEVSNP_EVIDENCE=vtpm \
+     SEVSNP_AMD_PRODUCT=Genoa \
+     SEVSNP_MANIFEST=$HOME/manifest.txt \
+     SEVSNP_PORT=8443 \
+     "$APPDIR/Server"
 ```
 
-On an Azure paravisor CVM the startup log looks like this instead — note that it names the evidence
-path it chose, so you never have to guess which one is in play:
+Setting `SEVSNP_EVIDENCE` explicitly is worth it on a first run: auto-detection reaches the same
+place, but forcing the path means a failure is unambiguously that path rather than a fallback you
+have to reason about.
+
+Expected on an Azure paravisor CVM — the log names the evidence path, so you never have to guess:
 
 ```
-info: Program[0] Connected to vTPM at /dev/tpmrm0.
-info: Program[0] HCL report parsed: 1184-byte SNP report, 460-byte runtime data, REPORT_DATA binding verified.
-info: Program[0] Evidence source: azure-vtpm (paravisor). NV 0x01400001 dataSize=2600, AK 0x81000003 …
-info: Program[0] The SNP report is static on this platform (written at boot). Freshness and the
-                 TLS-key binding come from the TPM2_Quote, not the report.
-info: Program[0] TLS SPKI SHA-256: 9f2c…
+info: VtpmEvidenceProvider[0] Connected to vTPM at /dev/tpmrm0.
+info: VtpmEvidenceProvider[0] TPM NV_BUFFER_MAX = 1024 bytes.
+info: VtpmEvidenceProvider[0] HCL report parsed: 1184-byte SNP report, 1233-byte runtime data,
+                              REPORT_DATA binding verified.
+info: VtpmEvidenceProvider[0] Manifest bound: digest <64 hex>, PCR 23 = <64 hex>
+info: Program[0]              Evidence source: azure-vtpm (paravisor). NV 0x01400001 dataSize=2600, …
+info: Program[0]              The SNP report is static on this platform (written at boot). …
+info: Program[0]              TLS SPKI SHA-256: <64 hex>
+info: Program[0]              Listening on https://0.0.0.0:8443 (self-signed; verified via attestation)
 ```
 
-`command not found` on a path you can see in `ls` means the path is wrong, not the permissions —
-a non-executable file gives `Permission denied` instead. The usual cause is the `scp` nesting
-described above; `find ~/attested-hello -name Server -type f` will locate it.
+On a bare SEV-SNP guest the first lines are replaced by `configfs-tsm ready: provider=sev_guest, …`.
 
-Expected startup log:
+The server **refuses to start** rather than serve unattested traffic; if it exits here, the log names
+which check failed and [Troubleshooting](#troubleshooting) covers each one.
 
+### 5. Attest  **[mac]**
+
+Copy the manifest over first — the digest is over the file's bytes, so both sides need it
+byte-identical:
+
+```bash
+scp azureuser@<cvm>:~/manifest.txt ./manifest.txt
+
+dotnet run --project Client -- \
+  --url https://<cvm>:8443 \
+  --ark amd/ark.pem \
+  --manifest ./manifest.txt
 ```
-info: Program[0] TSM provider: sev_guest
-info: Program[0] TLS SPKI SHA-256: 9f2c…
-info: Program[0] Listening on https://0.0.0.0:8443 (self-signed; verified via attestation)
+
+Once you have read your real values off a trusted first run, pin them:
+
+```bash
+dotnet run --project Client -- \
+  --url https://<cvm>:8443 \
+  --ark amd/ark.pem \
+  --manifest ./manifest.txt \
+  --min-tcb 12,0,28,88 \
+  --expect-measurement <96 hex chars>
 ```
+
+Success ends with `ATTESTATION OK` / `GET /hello -> Hello` and exit 0. Any failed check exits 1
+**without** sending the `/hello` request — that ordering is the entire point of the demo.
+
+> **Sync rule.** Steps 2, 3 and 5 move together. Republishing changes `Server.dll`, which changes the
+> manifest, so a redeploy always means regenerating `~/manifest.txt` and re-copying it. Skipping that
+> produces `PCR 23 is … expected …` — which reads like an attack but is just a stale manifest.
 
 ### Server configuration
 
 | Variable | Default | Purpose |
 | -------- | ------- | ------- |
 | `SEVSNP_PORT` | `8443` | Listen port |
-| `SEVSNP_AMD_PRODUCT` | `Milan` | AMD product line for the KDS fallback URL (`Milan`/`Genoa`/`Turin`) |
-| `SEVSNP_EVIDENCE` | auto | Force an evidence path: `configfs` or `vtpm`. Auto prefers `configfs`. |
+| `SEVSNP_AMD_PRODUCT` | `Milan` | AMD product line for the KDS fallback URL (`Milan`/`Genoa`/`Turin`). Unused when THIM answers |
+| `SEVSNP_EVIDENCE` | auto | Force an evidence path: `configfs` or `vtpm`. Auto prefers `configfs` |
 | `SEVSNP_TPM_DEVICE` | `/dev/tpmrm0` | vTPM device for the Azure path |
 | `SEVSNP_MANIFEST` | unset | Path to a manifest file; its SHA-256 is extended into PCR 23 |
-| `SEVSNP_MANIFEST_HASH` | unset | The manifest digest directly, as 64 hex chars. Mutually exclusive with the above |
+| `SEVSNP_MANIFEST_HASH` | unset | The manifest digest directly, 64 hex chars. Mutually exclusive with the above |
 
----
-
-## Run the client
-
-```bash
-dotnet run --project Client -- \
-  --url https://<cvm-ip>:8443 \
-  --ark amd/ark.pem
-```
-
-Hardened — this is what you should actually use once you know your values:
-
-```bash
-dotnet run --project Client -- \
-  --url https://<cvm-ip>:8443 \
-  --ark amd/ark.pem \
-  --min-tcb 12,0,28,88 \
-  --expect-measurement <96-hex-chars from a trusted first run>
-```
+### Client flags
 
 | Flag | Meaning |
 | ---- | ------- |
 | `--url <url>` | Server base URL (default `https://localhost:8443`) |
 | `--ark <path>` | Pinned AMD root PEM (default `amd/ark.pem`) |
 | `--product <line>` | Only affects the help text printed when `ark.pem` is missing |
-| `--expect-measurement <hex>` | 48-byte `MEASUREMENT` allow-list entry. **Set this in production.** |
+| `--expect-measurement <hex>` | 48-byte `MEASUREMENT` allow-list entry |
 | `--min-tcb bl,tee,snp,ucode` | Minimum acceptable `REPORTED_TCB`, compared component-wise |
-| `--require-smt-disabled` | Reject if the guest policy permits SMT (Azure hosts generally run SMT, so this fails there) |
+| `--require-smt-disabled` | Reject if the guest policy permits SMT (Azure hosts run SMT, so this fails there) |
 | `--expect-host-data <hex>` | Require this 32-byte `HOST_DATA`. Launch-time and immutable, but not settable on standard Azure CVMs |
 | `--manifest <path>` | Hash this file locally and require the quote's PCR 23 to match. vTPM path only |
 | `--expect-manifest <hex>` | Same check with the 32-byte digest supplied directly |
+
+Relative paths resolve against the directory you invoke `dotnet run` from, so run from the repo root
+or pass absolute paths.
 
 Exit codes: `0` verified, `1` verification or transport failure, `2` bad usage / missing anchor.
 
@@ -700,6 +754,26 @@ The `detail` names the failing TPM command.
   the parser searches rather than assuming.
 - **`Quote` fails with an auth error** — the AK may require a policy session on your image rather than
   empty auth. `VtpmEvidenceProvider` currently assumes empty auth.
+
+### `PCR 23 is <x> and the expected SHA-256(0^32 || manifestDigest) is <y>`
+
+Almost always a **stale manifest**, not an attack. Republishing changes `Server.dll`, which changes
+the manifest digest; if `~/manifest.txt` was not regenerated and re-copied, the client is checking
+against the previous build. Redo steps 3 and 5 together.
+
+If the manifest really is current, the server is running different code than the one you hashed —
+which is the check doing its job.
+
+### `PCR_Reset(23) reported success but the PCR reads <value>, not zero`
+
+This vTPM does not honour a reset of PCR 23, so the client cannot recompute the expected value. The
+server refuses to start rather than bind something unverifiable. Options: pick another resettable PCR
+(edit `ManifestPcr` in `VtpmEvidenceProvider` and `VtpmEvidenceVerifier`), bind at launch via
+`HOST_DATA` on a platform that exposes it, or run without `SEVSNP_MANIFEST` and accept that the
+evidence proves location but not workload identity.
+
+Note this is distinct from a mismatch *after* a successful reset: the server checks the PCR is zero
+before extending precisely so these two failures cannot be confused.
 
 ### `Trust anchor not found: amd/ark.pem`
 
